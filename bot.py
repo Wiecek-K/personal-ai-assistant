@@ -5,6 +5,7 @@ from os import getenv
 from dotenv import load_dotenv
 from collections import defaultdict
 from cryptography.fernet import Fernet
+from asyncio import create_task
 import json
 import base64
 import aiohttp
@@ -88,7 +89,12 @@ conversation_history = load_conversation_history()
 async def start(update: Update, context: CallbackContext) -> None:
     user_id = update.effective_user.id
     conversation_history[user_id] = []  # Reset history for this user
-    await update.message.reply_text("Hi! I'm your bot! Send me a message and I'll respond using GPT-4! I'll remember our conversation context.")
+    await update.message.reply_text(
+        "Hi! I'm your AI assistant! I can:\n"
+        "1. Chat with you using GPT-4\n"
+        "2. Analyze images you send\n"
+        "3. Generate images using DALL-E (/generate)\n"
+        "And I'll remember our conversation context!")
 
 
 async def handle_message(update: Update, context: CallbackContext) -> None:
@@ -277,9 +283,77 @@ async def handle_document(update: Update, context: CallbackContext) -> None:
         await update.message.reply_text(f"Sorry, I couldn't analyze the image: {str(e)}")
 
 
+async def generate_image(update: Update, context: CallbackContext) -> None:
+    """Generate an image using DALL-E based on user's description"""
+    async def process_image_generation(update: Update, prompt: str, processing_message):
+        try:
+            # Generate image using DALL-E
+            response = client.images.generate(
+                model="dall-e-3",
+                prompt=prompt,
+                size="1024x1024",
+                quality="standard",
+                n=1
+            )
+
+            # Get the URL of the generated image
+            image_url = response.data[0].url
+
+            # Download the image
+            async with aiohttp.ClientSession() as session:
+                async with session.get(image_url) as img_response:
+                    if img_response.status != 200:
+                        await processing_message.edit_text(
+                            "Sorry, I couldn't download the generated image.")
+                        return
+
+                    image_data = await img_response.read()
+
+            # Save to conversation history
+            user_id = update.effective_user.id
+            conversation_history[user_id].append(
+                {"role": "user", "content": f"[Generated image with prompt: {prompt}]"})
+
+            # Send the image
+            await update.message.reply_photo(
+                photo=image_data,
+                caption=f"🎨 Here's your generated image based on:\n\"{prompt}\""
+            )
+
+            # Delete the processing message
+            await processing_message.delete()
+
+        except Exception as e:
+            await processing_message.edit_text(
+                f"Sorry, I couldn't generate the image: {str(e)}")
+
+    try:
+        # Get the prompt from user's message
+        prompt = ' '.join(context.args)
+
+        if not prompt:
+            await update.message.reply_text(
+                "Please provide a description for the image you want to generate.\n"
+                "Example: /generate a cute cat playing with a ball of yarn")
+            return
+
+        # Send a temporary message to show that we're working
+        processing_message = await update.message.reply_text(
+            "🎨 Generating your image... This might take a moment.")
+
+        # Start image generation in a separate task
+        create_task(process_image_generation(
+            update, prompt, processing_message))
+
+    except Exception as e:
+        await update.message.reply_text(
+            f"Sorry, an error occurred: {str(e)}")
+
+
 app = Application.builder().token(TOKEN).build()
 app.add_handler(CommandHandler("start", start))
 app.add_handler(CommandHandler("clear", clear_history))
+app.add_handler(CommandHandler("generate", generate_image))
 app.add_handler(MessageHandler(
     filters.TEXT & ~filters.COMMAND, handle_message))
 app.add_handler(MessageHandler(filters.PHOTO, handle_image))

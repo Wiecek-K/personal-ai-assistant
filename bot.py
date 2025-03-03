@@ -7,6 +7,7 @@ from collections import defaultdict
 from cryptography.fernet import Fernet
 import json
 import base64
+import aiohttp
 
 load_dotenv()
 TOKEN = getenv('TELEGRAM_BOT_TOKEN')
@@ -39,6 +40,10 @@ MAX_HISTORY = 10
 
 # Dictionary to store conversation history for each user
 conversation_history = defaultdict(list)
+
+# Supported image formats
+SUPPORTED_FORMATS = {'image/jpeg', 'image/png', 'image/gif', 'image/webp'}
+MAX_IMAGE_SIZE = 20 * 1024 * 1024  # 20MB - OpenAI limit
 
 
 def save_conversation_history():
@@ -138,11 +143,147 @@ async def clear_history(update: Update, context: CallbackContext) -> None:
     save_conversation_history()
     await update.message.reply_text("Conversation history has been cleared!")
 
+
+async def handle_image(update: Update, context: CallbackContext) -> None:
+    """Handle image messages from users"""
+    try:
+        # Get the largest available photo
+        photo = update.message.photo[-1]
+
+        # Get file information
+        file = await context.bot.get_file(photo.file_id)
+
+        # Download the image
+        async with aiohttp.ClientSession() as session:
+            async with session.get(file.file_path) as response:
+                if response.status != 200:
+                    await update.message.reply_text("Sorry, I couldn't download the image.")
+                    return
+
+                # Check file size
+                content = await response.read()
+                if len(content) > MAX_IMAGE_SIZE:
+                    await update.message.reply_text("The image is too large. Maximum size is 20MB.")
+                    return
+
+                # Convert to base64
+                image_base64 = base64.b64encode(content).decode('utf-8')
+
+                # Send to OpenAI for analysis
+                response = client.chat.completions.create(
+                    model="gpt-4o-mini",
+                    messages=[
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "text", "text": "What's in this image? Please describe it in detail."},
+                                {
+                                    "type": "image_url",
+                                    "image_url": {
+                                        "url": f"data:image/jpeg;base64,{image_base64}"
+                                    }
+                                }
+                            ]
+                        }
+                    ],
+                    max_tokens=500
+                )
+
+                # Get the response
+                description = response.choices[0].message.content
+
+                # Save to conversation history
+                user_id = update.effective_user.id
+                conversation_history[user_id].append(
+                    {"role": "user", "content": "[User sent an image]"})
+                conversation_history[user_id].append(
+                    {"role": "assistant", "content": description})
+
+                # Trim history if needed
+                if len(conversation_history[user_id]) > MAX_HISTORY * 2:
+                    conversation_history[user_id] = conversation_history[user_id][-MAX_HISTORY * 2:]
+
+                # Save conversation history
+                save_conversation_history()
+
+                # Send the description back to user
+                await update.message.reply_text(description)
+
+    except Exception as e:
+        await update.message.reply_text(f"Sorry, I couldn't analyze the image: {str(e)}")
+
+
+async def handle_document(update: Update, context: CallbackContext) -> None:
+    """Handle document messages that might be images"""
+    try:
+        if not update.message.document.mime_type in SUPPORTED_FORMATS:
+            await update.message.reply_text(
+                "Sorry, I can only analyze images in these formats: JPEG, PNG, GIF, WEBP")
+            return
+
+        # Get file information
+        file = await context.bot.get_file(update.message.document.file_id)
+
+        # Process the same way as photos
+        async with aiohttp.ClientSession() as session:
+            async with session.get(file.file_path) as response:
+                if response.status != 200:
+                    await update.message.reply_text("Sorry, I couldn't download the image.")
+                    return
+
+                content = await response.read()
+                if len(content) > MAX_IMAGE_SIZE:
+                    await update.message.reply_text("The image is too large. Maximum size is 20MB.")
+                    return
+
+                image_base64 = base64.b64encode(content).decode('utf-8')
+
+                response = client.chat.completions.create(
+                    model="gpt-4o-mini",
+                    messages=[
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "text", "text": "What's in this image? Please describe it in detail."},
+                                {
+                                    "type": "image_url",
+                                    "image_url": {
+                                        "url": f"data:image/jpeg;base64,{image_base64}"
+                                    }
+                                }
+                            ]
+                        }
+                    ],
+                    max_tokens=500
+                )
+
+                description = response.choices[0].message.content
+
+                # Save to conversation history
+                user_id = update.effective_user.id
+                conversation_history[user_id].append(
+                    {"role": "user", "content": "[User sent an image]"})
+                conversation_history[user_id].append(
+                    {"role": "assistant", "content": description})
+
+                if len(conversation_history[user_id]) > MAX_HISTORY * 2:
+                    conversation_history[user_id] = conversation_history[user_id][-MAX_HISTORY * 2:]
+
+                save_conversation_history()
+
+                await update.message.reply_text(description)
+
+    except Exception as e:
+        await update.message.reply_text(f"Sorry, I couldn't analyze the image: {str(e)}")
+
+
 app = Application.builder().token(TOKEN).build()
 app.add_handler(CommandHandler("start", start))
 app.add_handler(CommandHandler("clear", clear_history))
 app.add_handler(MessageHandler(
     filters.TEXT & ~filters.COMMAND, handle_message))
+app.add_handler(MessageHandler(filters.PHOTO, handle_image))
+app.add_handler(MessageHandler(filters.Document.IMAGE, handle_document))
 
 print("Bot started!")
 app.run_polling()
